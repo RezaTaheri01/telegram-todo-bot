@@ -29,7 +29,7 @@ from telegram.ext import (
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
 django.setup()
 
-from todos.models import Todo
+from todos.models import Todo, TodoList
 
 # -------------------------
 # Config
@@ -99,7 +99,7 @@ def render_todos(todos):
 # KEYBOARD
 # -------------------------
 
-def build_keyboard(todos, user_id):
+def build_keyboard(todos, user_id, todo_list_id):
     keyboard = []
 
     active = [t for t in todos if not t.archived]
@@ -121,28 +121,80 @@ def build_keyboard(todos, user_id):
         ),
         InlineKeyboardButton(
             "🗂 Close Todos",
-            callback_data=f"archive:{user_id}",
+            callback_data=f"archive:{user_id}:{todo_list_id}",
         ),
     ])
 
     return InlineKeyboardMarkup(keyboard)
 
 # -------------------------
-# REFRESH UI
+# Fetch Todos
 # -------------------------
 
-async def refresh_ui(query, user_id):
-    todos = await sync_to_async(list)(
-        Todo.objects.filter(
+@sync_to_async
+def get_create_todos(user_id):
+    todo_list = (
+        TodoList.objects
+        .filter(
             telegram_user_id=user_id,
+            archived=False,
+        )
+        .first()
+    )
+
+    if not todo_list:
+        todo_list = TodoList.objects.create(
+            telegram_user_id=user_id,
+            name="My Tasks",
+        )
+
+    todos = list(
+        Todo.objects.filter(
+            todo_list=todo_list,
             archived=False,
         ).order_by("id")
     )
 
-    await query.edit_message_text(
-        render_todos(todos),
-        reply_markup=build_keyboard(todos, user_id),
+    return todos, todo_list.id
+
+
+@sync_to_async
+def get_todos(user_id):
+    todo_list = (
+        TodoList.objects
+        .filter(
+            telegram_user_id=user_id,
+            archived=False,
+        )
+        .first()
     )
+
+    if not todo_list:
+        return [], None
+
+    todos = list(
+        Todo.objects.filter(
+            todo_list=todo_list,
+            archived=False,
+        ).order_by("id")
+    )
+
+    return todos, todo_list.id
+
+# -------------------------
+# REFRESH UI
+# -------------------------
+
+async def refresh_ui(query, user_id):
+    todos, todo_list_id = await get_create_todos(user_id)
+
+    try:
+        await query.edit_message_text(
+            render_todos(todos),
+            reply_markup=build_keyboard(todos, user_id, todo_list_id),
+        )
+    except Exception as e:
+        pass
 
 # -------------------------
 # ADD TODOS
@@ -163,23 +215,29 @@ async def save_todos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for x in update.message.text.split(",")
         if x.strip()
     ]
+    
+    if not todos:
+        await update.message.reply_text(
+            "Please enter at least one todo."
+        )
+        return
+    
+    todo_list = await sync_to_async(TodoList.objects.get_or_create)(
+        telegram_user_id=user_id,
+        archived=False,
+    )
 
     for todo in todos:
         await sync_to_async(Todo.objects.create)(
-            telegram_user_id=user_id,
+            todo_list=todo_list[0],
             text=todo,
         )
 
-    todos = await sync_to_async(list)(
-        Todo.objects.filter(
-            telegram_user_id=user_id,
-            archived=False,
-        ).order_by("id")
-    )
+    todos_all, todo_list_id = await get_create_todos(user_id)
 
     await update.message.reply_text(
-        render_todos(todos),
-        reply_markup=build_keyboard(todos, user_id),
+        render_todos(todos_all),
+        reply_markup=build_keyboard(todos_all, user_id, todo_list_id),
     )
 
     await update.message.reply_text(
@@ -194,13 +252,8 @@ async def save_todos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.inline_query
     user_id = query.from_user.id
-
-    todos = await sync_to_async(list)(
-        Todo.objects.filter(
-            telegram_user_id=user_id,
-            archived=False,
-        ).order_by("id")
-    )
+    
+    todos, todo_list_id = await get_todos(user_id)
 
     if not todos:
         result = InlineQueryResultArticle(
@@ -222,7 +275,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         input_message_content=InputTextMessageContent(
             render_todos(todos)
         ),
-        reply_markup=build_keyboard(todos, user_id),
+        reply_markup=build_keyboard(todos, user_id, todo_list_id),
     )
 
     await query.answer([result], cache_time=0)
@@ -245,14 +298,20 @@ async def todo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if query.data.startswith("delete:"):
             _, todo_id = query.data.split(":")
-
-            todo = await sync_to_async(Todo.objects.get)(id=int(todo_id))
+            
+            try:
+                todo = await sync_to_async(Todo.objects.select_related("todo_list").get)(id=int(todo_id))
+            except Todo.DoesNotExist:
+                await query.answer("Todo not found", show_alert=True)
+                await query.edit_message_reply_markup(reply_markup=None)
+                return
+            
             if todo.archived:
                 await query.answer("Todo is not active to delete", show_alert=True)
                 await query.edit_message_reply_markup(reply_markup=None)
                 return
             
-            if todo.telegram_user_id != user_id:
+            if todo.todo_list.telegram_user_id != user_id:
                 await query.answer("Not yours", show_alert=True)
                 return
 
@@ -261,6 +320,7 @@ async def todo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("🗑 Deleted")
 
             return await delete_command(update, context)
+        
         # ---------------- REFRESH ----------------
         if query.data.startswith("refresh"):
             owner = query.data.split(":")[1]
@@ -270,17 +330,32 @@ async def todo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ---------------- ARCHIVE ----------------
         if query.data.startswith("archive"):
             owner = query.data.split(":")[1]
+            todo_list_id = query.data.split(":")[2]
+            
+            try:
+                todo_list = await sync_to_async(TodoList.objects.get)(id=int(todo_list_id))
+            except TodoList.DoesNotExist:
+                await query.answer("List not found", show_alert=True)
+                return
 
-            if owner != str(user_id):
-                await query.answer("Not allowed", show_alert=True)
+            if todo_list.telegram_user_id != user_id:
+                await query.answer("Not yours", show_alert=True)
+                return
+            
+            if todo_list.archived:
+                await query.answer("Already archived", show_alert=True)
+                await query.edit_message_reply_markup(None)
                 return
 
             await sync_to_async(
                 Todo.objects.filter(
-                    telegram_user_id=user_id,
+                    todo_list=todo_list,
                     archived=False,
                 ).update
             )(archived=True)
+            
+            todo_list.archived = True
+            await sync_to_async(todo_list.save)()
             
             await query.edit_message_reply_markup(None)
 
@@ -289,16 +364,17 @@ async def todo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ---------------- TOGGLE ----------------        
         _, todo_id = query.data.split(":")
 
-        todo = await sync_to_async(Todo.objects.get)(
-            id=int(todo_id)
-        )
+        try:
+            todo = await sync_to_async(Todo.objects.select_related("todo_list").get)(id=int(todo_id))
+        except Todo.DoesNotExist:
+            await query.answer("Todo not found", show_alert=True)
+            return await refresh_ui(query, user_id)
 
-        if todo.telegram_user_id != user_id:
+        if todo.todo_list.telegram_user_id != user_id:
             await query.answer("Not yours", show_alert=True)
             return
         else:
             await query.answer()
-            
 
         todo.completed = not todo.completed
         await sync_to_async(todo.save)()
@@ -317,13 +393,8 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
-
-    todos = await sync_to_async(list)(
-        Todo.objects.filter(
-            telegram_user_id=user_id,
-            archived=False,
-        ).order_by("id")
-    )
+    
+    todos, _ = await get_create_todos(user_id)
 
     if not todos:
         if update.message:
@@ -383,20 +454,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         help_text(context.bot.username),
         parse_mode="Markdown",
     )
+   
     
 async def todo_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
-    todos = await sync_to_async(list)(
-        Todo.objects.filter(
-            telegram_user_id=user_id,
-            archived=False,
-        ).order_by("id")
-    )
+    todos, todo_list_id = await get_create_todos(user_id)
 
     await update.message.reply_text(
         render_todos(todos),
-        reply_markup=build_keyboard(todos, user_id),
+        reply_markup=build_keyboard(todos, user_id, todo_list_id),
     )
     
 # -------------------------
