@@ -51,12 +51,12 @@ def help_text(bot_username: str):
         "📌 View anywhere:\n"
         f"`@{bot_username}`\n\n"
         "🧩 Controls:\n"
-        "✓ Toggle task\n"
+        "✓ Toggle todo\n"
         "🗑 Delete: /delete\n"
-        "🗂 Close Tasks(Not done all)\n"
+        "🗂 Close all todos\n"
         "🔄 Refresh list\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "⚡ Tip: Separate multiple tasks with commas (,)"
+        "⚡ Tip: Separate multiple todos with commas (,)"
     )
 
 # -------------------------
@@ -67,12 +67,12 @@ def render_todos(todos):
     active = [t for t in todos if not t.archived]
 
     lines = [
-        "🧠 TASK BOARD",
+        "🧠 TODO BOARD",
         "────────────────────",
     ]
 
     if not active:
-        lines.append("🎉 No active tasks")
+        lines.append("🎉 No active todos")
         lines.append("────────────────────")
         return "\n".join(lines)
 
@@ -148,6 +148,7 @@ async def refresh_ui(query, user_id):
 # ADD TODOS
 # -------------------------
 
+
 async def save_todos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -157,16 +158,16 @@ async def save_todos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
 
-    tasks = [
+    todos = [
         x.strip()
         for x in update.message.text.split(",")
         if x.strip()
     ]
 
-    for task in tasks:
+    for todo in todos:
         await sync_to_async(Todo.objects.create)(
             telegram_user_id=user_id,
-            text=task,
+            text=todo,
         )
 
     todos = await sync_to_async(list)(
@@ -182,7 +183,7 @@ async def save_todos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
-        f"✅ Added {len(tasks)} task(s)\nUse `@{BOT_USERNAME}`",
+        f"✅ Added {len(todos)} todo(s)\nUse `@{BOT_USERNAME}`",
         parse_mode="Markdown",
     )
 
@@ -217,7 +218,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = InlineQueryResultArticle(
         id="todos",
         title="My Todo List",
-        description=f"{len(todos)} tasks",
+        description=f"{len(todos)} todos",
         input_message_content=InputTextMessageContent(
             render_todos(todos)
         ),
@@ -246,7 +247,11 @@ async def todo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _, todo_id = query.data.split(":")
 
             todo = await sync_to_async(Todo.objects.get)(id=int(todo_id))
-
+            if todo.archived:
+                await query.answer("Todo is not active to delete", show_alert=True)
+                await query.edit_message_reply_markup(reply_markup=None)
+                return
+            
             if todo.telegram_user_id != user_id:
                 await query.answer("Not yours", show_alert=True)
                 return
@@ -378,7 +383,22 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         help_text(context.bot.username),
         parse_mode="Markdown",
     )
+    
+async def todo_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    todos = await sync_to_async(list)(
+        Todo.objects.filter(
+            telegram_user_id=user_id,
+            archived=False,
+        ).order_by("id")
+    )
 
+    await update.message.reply_text(
+        render_todos(todos),
+        reply_markup=build_keyboard(todos, user_id),
+    )
+    
 # -------------------------
 # MAIN
 # -------------------------
@@ -398,6 +418,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("todos",  todo_list))
     app.add_handler(CommandHandler("delete", delete_command))
 
     print("Todo bot running...")
