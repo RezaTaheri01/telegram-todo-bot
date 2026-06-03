@@ -64,7 +64,7 @@ def help_text(bot_username: str):
 # -------------------------
 
 def render_todos(todos):
-    active = [t for t in todos if not t.archived]
+    active = [t for t in todos]
 
     lines = [
         "🧠 TODO BOARD",
@@ -117,7 +117,7 @@ def build_keyboard(todos, user_id, todo_list_id):
     keyboard.append([
         InlineKeyboardButton(
             "🔄 Refresh",
-            callback_data=f"refresh:{user_id}",
+            callback_data=f"refresh:{user_id}:{todo_list_id}",
         ),
         InlineKeyboardButton(
             "🗂 Close Todos",
@@ -158,7 +158,8 @@ def get_create_todos(user_id):
     return todos, todo_list.id
 
 
-@sync_to_async
+# sync_to_async with thread_sensitive=False (better performance for read-only operations)
+@sync_to_async(thread_sensitive=False)
 def get_todos(user_id):
     todo_list = (
         TodoList.objects
@@ -180,6 +181,23 @@ def get_todos(user_id):
     )
 
     return todos, todo_list.id
+
+
+# sync_to_async with thread_sensitive=False (better performance for read-only operations)
+@sync_to_async(thread_sensitive=False)
+def get_archived_todos(todo_list_id):
+    todo_list_exist = TodoList.objects.filter(
+        id=todo_list_id,
+        archived=True,
+    ).exists()
+
+    if not todo_list_exist:
+        return []
+
+    return list(Todo.objects.filter(
+        todo_list=todo_list_id,
+        archived=True,
+        ).order_by("id"))
 
 # -------------------------
 # REFRESH UI
@@ -324,6 +342,21 @@ async def todo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ---------------- REFRESH ----------------
         if query.data.startswith("refresh"):
             owner = query.data.split(":")[1]
+            todo_list_id = query.data.split(":")[2]
+            
+            try:
+                todo_list = await sync_to_async(TodoList.objects.get)(id=int(todo_list_id))
+            except TodoList.DoesNotExist:
+                await query.answer("List not found", show_alert=True)
+                return
+            
+            if todo_list.archived:
+                todos = await get_archived_todos(todo_list_id)
+                await query.answer("Already archived", show_alert=True)
+                await query.edit_message_text(render_todos(todos),
+                                              reply_markup=None)
+                return
+            
             await query.answer("Refreshing...")
             return await refresh_ui(query, owner)
 
@@ -343,10 +376,13 @@ async def todo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             
             if todo_list.archived:
+                todos = await get_archived_todos(todo_list_id)
                 await query.answer("Already archived", show_alert=True)
-                await query.edit_message_reply_markup(None)
+                await query.edit_message_text(render_todos(todos),
+                                              reply_markup=None)
                 return
 
+            # Archive on empty todo_list
             await sync_to_async(
                 Todo.objects.filter(
                     todo_list=todo_list,
@@ -367,8 +403,13 @@ async def todo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             todo = await sync_to_async(Todo.objects.select_related("todo_list").get)(id=int(todo_id))
         except Todo.DoesNotExist:
-            await query.answer("Todo not found", show_alert=True)
-            return await refresh_ui(query, user_id)
+            await query.answer("Todo not found, Please refresh.")
+            return
+            # return await refresh_ui(query, user_id)
+        
+        if todo.archived:
+            await query.answer("Todo list was archived, Close it!")
+            return
 
         if todo.todo_list.telegram_user_id != user_id:
             await query.answer("Not yours", show_alert=True)
